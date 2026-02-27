@@ -123,7 +123,19 @@ function buildVolumeMounts(
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   // Ensure the container's node user (uid 1000) can write here even when the
   // host process runs as root and creates the directory with root ownership.
-  try { fs.chmodSync(groupSessionsDir, 0o777); } catch { /* ignore */ }
+  // Also chmod any subdirs created by previous container runs (e.g. debug/,
+  // telemetry/) — they may be 0755 owned by a different uid, causing EACCES.
+  try {
+    fs.chmodSync(groupSessionsDir, 0o777);
+    for (const entry of fs.readdirSync(groupSessionsDir)) {
+      const entryPath = path.join(groupSessionsDir, entry);
+      try {
+        if (fs.statSync(entryPath).isDirectory()) {
+          fs.chmodSync(entryPath, 0o777);
+        }
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
 
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
 
