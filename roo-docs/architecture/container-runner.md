@@ -33,3 +33,34 @@ JSON objects between these markers are parsed as `ContainerOutput`, which can co
 - **Read-only Mounts**: Prevents agents from modifying the host application code.
 - **User Mapping**: Runs the container as the host user's UID/GID to ensure correct file permissions on bind mounts.
 - **Secret Management**: Secrets (API keys) are passed via `stdin` and never written to the container's disk.
+
+## Known Issues & Gotchas
+
+### Session Directory Subdirectory Permissions (EACCES Crash)
+
+Containers can crash immediately on second and subsequent runs with `EACCES: permission denied` when the Claude SDK tries to initialize its debug logger.
+
+#### The Problem
+The `.claude/` session directory is bind-mounted at `/home/node/.claude` inside the container.
+1.  **First Run**: The Claude SDK creates subdirectories like `debug/` and `telemetry/` using the default umask (typically 0o022).
+2.  **Host Ownership**: These subdirs are created with mode `0o755` (rwxr-xr-x) and are owned by the host user's UID.
+3.  **Subsequent Runs**: The container's `node` user (UID 1000) lacks write permission to these `0o755` directories owned by the host. The SDK fails to initialize, and the container exits silently with code 1.
+
+#### The Fix
+`fs.chmodSync()` on a directory does not recurse into children. To fix this, `src/container-runner.ts` (lines 128-138) now performs a shallow recursive chmod before each spawn:
+
+```typescript
+fs.chmodSync(groupSessionsDir, 0o777);
+for (const entry of fs.readdirSync(groupSessionsDir)) {
+  const entryPath = path.join(groupSessionsDir, entry);
+  if (fs.statSync(entryPath).isDirectory()) {
+    fs.chmodSync(entryPath, 0o777);
+  }
+}
+```
+
+#### Manual Remediation
+For existing corrupted session directories, run:
+```bash
+find /opt/nanoclaw/data/sessions -type d \( -name "debug" -o -name "telemetry" \) -exec chmod 777 {} \;
+```
