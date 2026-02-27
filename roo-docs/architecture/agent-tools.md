@@ -81,3 +81,25 @@ If a tool like `+journal` or `+dump` fails, check the following layers:
 
 ### Layer 4: Subprocess Level
 - **Secrets**: Verify that the required secrets (e.g., `NOTES_URL`, `SHLINK_API_KEY`) are present in the host's `.env` and whitelisted in `src/ipc.ts`.
+
+## Best Practices: Multi-Step Tasks & Feedback
+
+When an agent performs long-running or multi-step tasks (e.g., reading multiple journals, summarizing, and writing to a vault), it can appear to "hang" because the host only displays the agent's final result.
+
+To ensure a good user experience, agents should follow these patterns:
+
+### 1. Mandatory Progress Feedback
+Always use `mcp__nanoclaw__send_message` to acknowledge the task *before* starting any long-running tool calls.
+- **Example**: "Ugh, fine. Reading your boring journals now..."
+
+### 2. Explicit Vault Write Workflow
+When writing summaries or research results to the vault, follow this 6-step sequence:
+1.  **Acknowledge**: Call `mcp__nanoclaw__send_message` to let the user know work has started.
+2.  **Work**: Perform the research, reading, or summarization.
+3.  **Write**: Call `mcp__nanoclaw__write_vault_file` with the non-empty content.
+4.  **URL Chain**: Call `mcp__nanoclaw__get_vault_url` followed by `mcp__nanoclaw__get_short_url`.
+5.  **Confirm**: Call `mcp__nanoclaw__send_message` with the short URL and a brief confirmation.
+6.  **Finalize**: Provide a minimal final text response (since the main result was already sent).
+
+### 3. Content Validation
+Never call `write_vault_file` with empty content. If no data was found or generated, inform the user via `send_message` and stop the workflow.
