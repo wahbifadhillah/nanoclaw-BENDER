@@ -64,8 +64,30 @@ Specialized TypeScript scripts run via `tsx`.
 - **Vault Readers**: `search_vault.ts` (content/filename search across `/opt/vault`).
 - **Utility Tools**: `get_vault_url.ts`, `get_short_url.ts`.
 
-### 4. Direct Vault Mount
-In addition to IPC-based tools, the vault (`/opt/vault`) is mounted read-only into every container at `/workspace/vault`. Agents can use their native `Read`, `Glob`, and `Grep` tools directly against this path for single-file reads or ad-hoc searches — no IPC overhead required. Use `mcp__nanoclaw__search_vault` when you need bounded, structured results across the whole vault.
+### 4. Vault Access: Two-Layer Design
+
+NanoClaw agents have two complementary ways to access the Obsidian vault (`/opt/vault`). This layered design balances performance (zero-overhead reads) with discoverability (structured search).
+
+#### Layer 1: Direct Read-Only Mount (Performance)
+The vault is mounted into every container at `/workspace/vault` (read-only). Agents use native Claude Code tools directly:
+- `Read /workspace/vault/journal/25-02-2026-journal.md`
+- `Glob /workspace/vault/**/*.md`
+- `Grep "query" /workspace/vault/`
+
+**Benefit**: Zero IPC overhead. If the agent knows the path, it reads instantly.
+
+#### Layer 2: `mcp__nanoclaw__search_vault` (Discovery)
+For bounded discovery across the full vault when the exact path is unknown.
+- **Parameters**: `query` (min 2 chars), `path` (optional subdir), `mode` (`content` | `filename`).
+- **Returns**: Up to 20 matching files with up to 5 matching lines each (format: `L<n>: <text>`).
+- **Implementation**: Recursive `.md` walker in `.claude/skills/vault/search_vault.ts` with path traversal protection.
+
+**Benefit**: One IPC call returns multiple results with context, avoiding the 15s poll window overhead for multiple individual reads during discovery.
+
+#### Caveats
+- **Container rebuild required** for the MCP tool: `sudo docker buildx prune -f && sudo ./container/build.sh`.
+- Search is bounded at 20 files / 5 lines per file.
+- Only `.md` files are indexed by the search tool; other formats are readable via direct mount.
 
 ## Debugging & Troubleshooting
 
