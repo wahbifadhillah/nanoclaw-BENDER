@@ -3,12 +3,18 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  DATA_DIR,
   IDLE_TIMEOUT,
+  IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
+  TELEGRAM_BOT_POOL,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_ONLY,
   TRIGGER_PATTERN,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
+import { hasPoolBots, initBotPool, TelegramChannel } from './channels/telegram.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -32,7 +38,6 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
@@ -47,6 +52,13 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+/**
+ * Callbacks registered by active processGroupMessages runs.
+ * When sendPoolMessage succeeds for a chatJid, the IPC watcher fires the callback
+ * so the streaming fallback knows pool delivery already happened.
+ */
+const activePoolCallbacks = new Map<string, () => void>();
 
 let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
@@ -78,21 +90,11 @@ function saveState(): void {
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
-  let groupDir: string;
-  try {
-    groupDir = resolveGroupFolderPath(group.folder);
-  } catch (err) {
-    logger.warn(
-      { jid, folder: group.folder, err },
-      'Rejecting group registration with invalid folder',
-    );
-    return;
-  }
-
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
 
   // Create group folder
+  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
   logger.info(
@@ -133,10 +135,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (!group) return true;
 
   const channel = findChannel(channels, chatJid);
-  if (!channel) {
-    console.log(`Warning: no channel owns JID ${chatJid}, skipping messages`);
-    return true;
-  }
+  if (!channel) return true;
 
   const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
 
@@ -182,6 +181,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
+  // For Telegram+pool: track whether any pool message was delivered during this run.
+  // If the agent doesn't call send_message (e.g., routed reviewer agents), pool delivery
+  // never fires and we fall back to the streaming text via the main bot.
+  const isTelegramWithPool = chatJid.startsWith('tg:') && hasPoolBots();
+  let poolDelivered = false;
+  let fallbackText: string | null = null;
+  if (isTelegramWithPool) {
+    activePoolCallbacks.set(chatJid, () => { poolDelivered = true; });
+  }
+
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
@@ -190,15 +199,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        if (!isTelegramWithPool) {
+          // Non-pool path: send directly via channel (WhatsApp or Telegram without pool)
+          await channel.sendMessage(chatJid, text);
+        } else {
+          // Pool path: IPC send_message is primary (preserves bot identity).
+          // Save text so we can fall back if the agent didn't call send_message.
+          fallbackText = text;
+        }
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
-    }
-
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
     }
 
     if (result.status === 'error') {
@@ -208,6 +220,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+
+  // Fallback: if Telegram+pool but the agent never called send_message (no IPC delivery),
+  // wait one IPC poll cycle for any in-flight IPC files to be processed, then send via
+  // the main bot if still nothing was delivered.
+  if (isTelegramWithPool) {
+    activePoolCallbacks.delete(chatJid);
+    if (fallbackText && !poolDelivered) {
+      await new Promise((r) => setTimeout(r, IPC_POLL_INTERVAL + 200));
+      if (!poolDelivered) {
+        logger.info({ group: group.name }, 'No pool delivery detected — falling back to main bot');
+        await channel.sendMessage(chatJid, fallbackText);
+      }
+    }
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
@@ -280,7 +306,6 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
-        assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
@@ -343,10 +368,7 @@ async function startMessageLoop(): Promise<void> {
           if (!group) continue;
 
           const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            console.log(`Warning: no channel owns JID ${chatJid}, skipping messages`);
-            continue;
-          }
+          if (!channel) continue;
 
           const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
           const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
@@ -381,9 +403,7 @@ async function startMessageLoop(): Promise<void> {
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
             // Show typing indicator while the container processes the piped message
-            channel.setTyping?.(chatJid, true)?.catch((err) =>
-              logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-            );
+            channel.setTyping?.(chatJid, true);
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -415,22 +435,52 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
-  ensureContainerRuntimeRunning();
-  cleanupOrphans();
+function acquirePidLock(): string {
+  const lockFile = path.join(DATA_DIR, 'nanoclaw.pid');
+  const currentPid = process.pid;
+
+  // Check if another instance is already running
+  if (fs.existsSync(lockFile)) {
+    const existingPid = parseInt(fs.readFileSync(lockFile, 'utf-8').trim(), 10);
+    if (!isNaN(existingPid) && existingPid !== currentPid) {
+      // Check if the process is still alive
+      try {
+        process.kill(existingPid, 0); // Signal 0 = just check existence
+        logger.error(
+          { existingPid, currentPid },
+          'Another NanoClaw instance is already running. Exiting to prevent duplicate agents.',
+        );
+        process.exit(1);
+      } catch {
+        // Process doesn't exist — stale lock file, safe to overwrite
+        logger.warn(
+          { existingPid, currentPid },
+          'Found stale PID lock file, overwriting',
+        );
+      }
+    }
+  }
+
+  fs.writeFileSync(lockFile, String(currentPid));
+  logger.info({ pid: currentPid, lockFile }, 'PID lock acquired');
+  return lockFile;
 }
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  ensureContainerRuntimeRunning();
+  cleanupOrphans();
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  const pidLockFile = acquirePidLock();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
+    try { fs.unlinkSync(pidLockFile); } catch { /* ignore */ }
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -445,9 +495,20 @@ async function main(): Promise<void> {
   };
 
   // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
+  if (!TELEGRAM_ONLY) {
+    whatsapp = new WhatsAppChannel(channelOpts);
+    channels.push(whatsapp);
+    await whatsapp.connect();
+  }
+
+  if (TELEGRAM_BOT_TOKEN) {
+    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
+    channels.push(telegram);
+    await telegram.connect();
+    if (TELEGRAM_BOT_POOL.length > 0) {
+      await initBotPool(TELEGRAM_BOT_POOL);
+    }
+  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -457,10 +518,7 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
-      if (!channel) {
-        console.log(`Warning: no channel owns JID ${jid}, cannot send message`);
-        return;
-      }
+      if (!channel) return;
       const text = formatOutbound(rawText);
       if (text) await channel.sendMessage(jid, text);
     },
@@ -476,13 +534,11 @@ async function main(): Promise<void> {
     syncGroupMetadata: (force) => whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
+    onPoolMessageSent: (jid) => activePoolCallbacks.get(jid)?.(),
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
-  startMessageLoop().catch((err) => {
-    logger.fatal({ err }, 'Message loop crashed unexpectedly');
-    process.exit(1);
-  });
+  startMessageLoop();
 }
 
 // Guard: only run when executed directly, not when imported by tests

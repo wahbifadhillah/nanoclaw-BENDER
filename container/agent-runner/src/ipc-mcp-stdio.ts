@@ -20,6 +20,38 @@ const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
 
+/**
+ * Write an IPC task and poll for its result.
+ * Shared helper for chaining atomic tools from within MCP handlers.
+ * Returns the parsed result or null on timeout/error.
+ */
+async function ipcCall(
+  type: string,
+  taskId: string,
+  params: object,
+  resultsDirName: string,
+): Promise<Record<string, unknown> | null> {
+  const resultsDir = path.join(IPC_DIR, resultsDirName);
+  const resultFile = path.join(resultsDir, `${taskId}.json`);
+
+  fs.mkdirSync(resultsDir, { recursive: true });
+  writeIpcFile(TASKS_DIR, { type, taskId, params });
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    if (fs.existsSync(resultFile)) {
+      try {
+        const result = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+        fs.unlinkSync(resultFile);
+        return result;
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null; // timeout
+}
+
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
 
@@ -276,6 +308,346 @@ Use available_groups.json to find the JID for a group. The folder name should be
 
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
+    };
+  },
+);
+
+server.tool(
+  'save_journal',
+  [
+    'Append a journal entry to the daily markdown file in the Obsidian vault.',
+    'Call this when the user sends +journal followed by their entry text.',
+    'Entries are timestamped and appended — never overwritten.',
+    'One file per day at /opt/vault/journal/DD-MM-YYYY-journal.md.',
+    'Returns a short URL to the journal file.',
+  ].join(' '),
+  {
+    raw_input: z.string().describe(
+      'The full raw +journal message from the user, including the trigger line and entry content',
+    ),
+  },
+  async (args) => {
+    // Parse content: strip the +journal / /journal trigger line
+    const lines = args.raw_input.split('\n');
+    const firstLine = lines[0].trim().toLowerCase();
+    const bodyLines =
+      firstLine.startsWith('/journal') || firstLine.startsWith('+journal')
+        ? lines.slice(1)
+        : lines;
+    const content = bodyLines.join('\n').trim();
+
+    if (!content) {
+      return {
+        content: [{ type: 'text' as const, text: '❌ Journal entry is empty. Add some text after +journal.' }],
+        isError: true,
+      };
+    }
+
+    // Step 1: Write journal entry (file I/O only)
+    const taskId = `journal-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const journalResult = await ipcCall('journal', taskId, { content }, 'journal_results');
+
+    if (!journalResult) {
+      return {
+        content: [{ type: 'text' as const, text: '❌ Journal task timed out. Host may not be processing journal tasks.' }],
+        isError: true,
+      };
+    }
+
+    if (!journalResult.success) {
+      return {
+        content: [{ type: 'text' as const, text: `❌ ${journalResult.error || 'Journal write failed.'}` }],
+        isError: true,
+      };
+    }
+
+    const filename = journalResult.filename as string;
+    const vaultPath = journalResult.vaultPath as string | undefined;
+
+    // Step 2: Chain — get_vault_url → get_short_url (journal always gets a URL)
+    let urlLine = '';
+    if (vaultPath) {
+      const vaultUrlId = `vault-url-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const vaultUrlResult = await ipcCall('vault_url', vaultUrlId, { vault_path: vaultPath }, 'vault_url_results');
+
+      if (vaultUrlResult?.success && vaultUrlResult.url) {
+        const shortUrlId = `short-url-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        const shortUrlResult = await ipcCall('short_url', shortUrlId, { url: vaultUrlResult.url }, 'short_url_results');
+        urlLine = `\n${(shortUrlResult?.url as string) || (vaultUrlResult.url as string)}`;
+      }
+    }
+
+    // Step 3: Build response message
+    const treeLines = [
+      '```',
+      '├── journal/',
+      `└── ${filename}`,
+      '```',
+    ].join('\n');
+
+    const text = `✅ Saved journal entry to:\n${treeLines}${urlLine}`;
+    return { content: [{ type: 'text' as const, text }] };
+  },
+);
+
+server.tool(
+  'dump_tasks',
+  [
+    'Save todo tasks to tagged markdown files in the Obsidian vault.',
+    'Call this when the user sends +dump with #tag and a list of tasks.',
+    'Automatically converts `- item` to `- [ ] item` checkbox format.',
+    'Appends to existing tag files with timestamp, never overwrites.',
+    'For single-tag dumps, returns a short URL to the tag file.',
+  ].join(' '),
+  {
+    raw_input: z.string().describe(
+      'The full raw +dump message from the user, including #tags and task lines',
+    ),
+  },
+  async (args) => {
+    // Parse tags from any line
+    const lines = args.raw_input.split('\n').map((l: string) => l.trim()).filter(Boolean);
+    const tagPattern = /#([a-zA-Z0-9_-]+)/g;
+    const tags: string[] = [];
+    for (const line of lines) {
+      let match;
+      while ((match = tagPattern.exec(line)) !== null) {
+        tags.push(match[1]);
+      }
+    }
+
+    // Parse task lines (lines starting with `- `)
+    const tasks: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith('- ')) {
+        if (line.startsWith('- [ ] ') || line.startsWith('- [x] ')) {
+          tasks.push(line);
+        } else {
+          tasks.push(`- [ ] ${line.slice(2)}`);
+        }
+      }
+    }
+
+    // Validate
+    if (tags.length === 0) {
+      return {
+        content: [{ type: 'text' as const, text: '❌ No tags found. Use #tagname in your +dump message.' }],
+        isError: true,
+      };
+    }
+    const invalidTags = tags.filter(t => !/^[a-zA-Z0-9_-]+$/.test(t));
+    if (invalidTags.length > 0) {
+      return {
+        content: [{ type: 'text' as const, text: `❌ Invalid tag names: ${invalidTags.map(t => `#${t}`).join(', ')}. Only letters, numbers, hyphens, underscores allowed.` }],
+        isError: true,
+      };
+    }
+    if (tasks.length === 0) {
+      return {
+        content: [{ type: 'text' as const, text: '❌ No task items found. Add items starting with `- ` or `- [ ]`.' }],
+        isError: true,
+      };
+    }
+
+    // Step 1: Write dump entries (file I/O only)
+    const taskId = `dump-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const dumpResult = await ipcCall('dump', taskId, { tags, tasks }, 'dump_results');
+
+    if (!dumpResult) {
+      return {
+        content: [{ type: 'text' as const, text: '❌ Dump task timed out. Host may not be processing dump tasks.' }],
+        isError: true,
+      };
+    }
+
+    if (!dumpResult.success) {
+      return {
+        content: [{ type: 'text' as const, text: `❌ ${dumpResult.error || 'Dump write failed.'}` }],
+        isError: true,
+      };
+    }
+
+    const results = dumpResult.results as Array<{ tag: string; taskCount: number; vaultPath: string }>;
+
+    // Step 2: Chain — get_vault_url → get_short_url (single-tag only)
+    let urlLine = '';
+    if (results.length === 1 && results[0].vaultPath) {
+      const vaultUrlId = `vault-url-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const vaultUrlResult = await ipcCall('vault_url', vaultUrlId, { vault_path: results[0].vaultPath }, 'vault_url_results');
+
+      if (vaultUrlResult?.success && vaultUrlResult.url) {
+        const shortUrlId = `short-url-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        const shortUrlResult = await ipcCall('short_url', shortUrlId, { url: vaultUrlResult.url }, 'short_url_results');
+        urlLine = `\n${(shortUrlResult?.url as string) || (vaultUrlResult.url as string)}`;
+      }
+    }
+
+    // Step 3: Build response message
+    let text: string;
+    if (results.length === 1) {
+      const r = results[0];
+      const entryWord = r.taskCount === 1 ? 'entry' : 'entries';
+      const treeLines = ['```', '├── dumps/', `└── ${r.tag}`, '```'].join('\n');
+      text = `✅ Saved ${r.taskCount} ${entryWord} to:\n${treeLines}${urlLine}`;
+    } else {
+      const dumpWord = results.length === 1 ? 'dump' : 'dumps';
+      const treeLines = [
+        '```',
+        '├── dumps/',
+        ...results.map((r, i) => {
+          const prefix = i === results.length - 1 ? '└── ' : '├── ';
+          const entryWord = r.taskCount === 1 ? 'entry' : 'entries';
+          return `${prefix}${r.tag} --${r.taskCount} ${entryWord}`;
+        }),
+        '```',
+      ].join('\n');
+      text = `✅ Saved ${results.length} ${dumpWord} to:\n${treeLines}`;
+    }
+
+    return { content: [{ type: 'text' as const, text }] };
+  },
+);
+
+server.tool(
+  'write_vault_file',
+  [
+    'Write or append content to a file in the Obsidian vault.',
+    'Use mode="write" to create or overwrite a file entirely.',
+    'Use mode="append" to add content to the end of a file (creates it if missing).',
+    'vault_path is relative to the vault root, e.g. "research/ai-notes.md" or "projects/tracker.md".',
+    'You decide the content format — headers, timestamps, front matter, Markdown structure.',
+    'Returns the vaultPath so you can optionally chain get_vault_url → get_short_url for a link.',
+    'Only .md files are supported. Paths outside the vault root are rejected.',
+  ].join(' '),
+  {
+    vault_path: z.string().describe(
+      'Vault-relative path to the file, e.g. "research/ai-notes.md". Parent directories are created automatically.',
+    ),
+    content: z.string().describe(
+      'The text content to write or append. You control the format — include headers, timestamps, front matter as needed.',
+    ),
+    mode: z.enum(['write', 'append']).default('append').describe(
+      '"write" creates or overwrites the file entirely. "append" adds to the end and creates the file if missing.',
+    ),
+  },
+  async (args) => {
+    const taskId = `write-vault-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const result = await ipcCall(
+      'write_vault_file',
+      taskId,
+      { vault_path: args.vault_path, content: args.content, mode: args.mode },
+      'write_vault_file_results',
+    );
+
+    if (!result) {
+      return {
+        content: [{ type: 'text' as const, text: '❌ write_vault_file timed out.' }],
+        isError: true,
+      };
+    }
+
+    if (!result.success) {
+      return {
+        content: [{ type: 'text' as const, text: `❌ ${result.error || 'Write failed.'}` }],
+        isError: true,
+      };
+    }
+
+    // Return vaultPath so agent can chain get_vault_url → get_short_url if desired
+    const text = `✅ ${args.mode === 'write' ? 'Written' : 'Appended'} to: ${result.vaultPath as string}`;
+    return { content: [{ type: 'text' as const, text }] };
+  },
+);
+
+server.tool(
+  'get_vault_url',
+  [
+    'Convert a vault-relative file path to a full browser URL for the Obsidian vault (SilverBullet).',
+    'Use this to get a readable link to any vault file before optionally shortening it.',
+    'Input: vault_path like "dumps/my-tag.md" or "journal/25-02-2026-journal.md".',
+    'Output: the full URL, e.g. "https://notes.im7try1ng.com/dumps/my-tag.md".',
+    'Chain with get_short_url to produce a short link.',
+  ].join(' '),
+  {
+    vault_path: z.string().describe(
+      'Vault-relative file path, e.g. "dumps/my-tag.md". May optionally include a leading "vault/" prefix which will be stripped.',
+    ),
+  },
+  async (args) => {
+    const taskId = `vault-url-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const resultsDir = path.join(IPC_DIR, 'vault_url_results');
+    const resultFile = path.join(resultsDir, `${taskId}.json`);
+
+    fs.mkdirSync(resultsDir, { recursive: true });
+    writeIpcFile(TASKS_DIR, { type: 'vault_url', taskId, params: { vault_path: args.vault_path } });
+
+    // Poll for result (max 15s)
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      if (fs.existsSync(resultFile)) {
+        try {
+          const result = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+          fs.unlinkSync(resultFile);
+          const text = result.url || (result.success ? '✅ URL built.' : `❌ ${result.error}`);
+          return { content: [{ type: 'text' as const, text }] };
+        } catch {
+          return {
+            content: [{ type: 'text' as const, text: '❌ Failed to read vault URL result.' }],
+            isError: true,
+          };
+        }
+      }
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: '❌ get_vault_url timed out. Host may not be processing vault_url tasks.' }],
+      isError: true,
+    };
+  },
+);
+
+server.tool(
+  'get_short_url',
+  [
+    'Create a short URL via Shlink for any long URL.',
+    'Use this before returning URLs to the user — short links are friendlier in Telegram.',
+    'Chain after get_vault_url: get_vault_url → get_short_url → reply with short URL.',
+    'Input: any full URL. Output: short URL like "https://s.im7try1ng.com/abc123".',
+  ].join(' '),
+  {
+    url: z.string().describe(
+      'The full URL to shorten, e.g. "https://notes.im7try1ng.com/dumps/my-tag.md".',
+    ),
+  },
+  async (args) => {
+    const taskId = `short-url-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const resultsDir = path.join(IPC_DIR, 'short_url_results');
+    const resultFile = path.join(resultsDir, `${taskId}.json`);
+
+    fs.mkdirSync(resultsDir, { recursive: true });
+    writeIpcFile(TASKS_DIR, { type: 'short_url', taskId, params: { url: args.url } });
+
+    // Poll for result (max 15s)
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      if (fs.existsSync(resultFile)) {
+        try {
+          const result = JSON.parse(fs.readFileSync(resultFile, 'utf-8'));
+          fs.unlinkSync(resultFile);
+          const text = result.url || (result.success ? '✅ URL shortened.' : `❌ ${result.error}`);
+          return { content: [{ type: 'text' as const, text }] };
+        } catch {
+          return {
+            content: [{ type: 'text' as const, text: '❌ Failed to read short URL result.' }],
+            isError: true,
+          };
+        }
+      }
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: '❌ get_short_url timed out. Host may not be processing short_url tasks.' }],
+      isError: true,
     };
   },
 );

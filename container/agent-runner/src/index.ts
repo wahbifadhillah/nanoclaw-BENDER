@@ -27,6 +27,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  agentSystemPrompt?: string;
   secrets?: Record<string, string>;
 }
 
@@ -391,11 +392,17 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
-  // Load global CLAUDE.md as additional system context (shared across all groups)
+  // Load system prompts: agent-specific personality is complete and exclusive.
+  // Global CLAUDE.md only applies to main group or when no agent personality is routed.
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
+  let combinedSystemPrompt: string | undefined = undefined;
+
+  if (containerInput.agentSystemPrompt) {
+    // Agent has explicit personality routing — use it exclusively
+    combinedSystemPrompt = containerInput.agentSystemPrompt;
+  } else if (containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+    // Main group without agent routing — use global context
+    combinedSystemPrompt = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
   // Discover additional directories mounted at /workspace/extra/*
@@ -421,9 +428,7 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
+      systemPrompt: combinedSystemPrompt ?? undefined,
       allowedTools: [
         'Bash',
         'Read', 'Write', 'Edit', 'Glob', 'Grep',
@@ -482,6 +487,9 @@ async function runQuery(
         result: textResult || null,
         newSessionId
       });
+      // Signal claude to exit — without this, the MessageStream stays open
+      // and claude waits for more input indefinitely (sleeping until 30-min timeout).
+      stream.end();
     }
   }
 

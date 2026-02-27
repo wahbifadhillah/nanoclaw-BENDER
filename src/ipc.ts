@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -9,9 +10,11 @@ import {
   MAIN_GROUP_FOLDER,
   TIMEZONE,
 } from './config.js';
+import { sendPoolMessage } from './channels/telegram.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
+import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
@@ -27,6 +30,8 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  /** Called when a pool message is successfully sent for a chatJid (Telegram+pool path). */
+  onPoolMessageSent?: (chatJid: string) => void;
 }
 
 let ipcWatcherRunning = false;
@@ -79,9 +84,19 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  if (data.sender && data.chatJid.startsWith('tg:')) {
+                    await sendPoolMessage(
+                      data.chatJid,
+                      data.text,
+                      data.sender,
+                      sourceGroup,
+                    );
+                    deps.onPoolMessageSent?.(data.chatJid);
+                  } else {
+                    await deps.sendMessage(data.chatJid, data.text);
+                  }
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
+                    { chatJid: data.chatJid, sourceGroup, sender: data.sender },
                     'IPC message sent',
                   );
                 } else {
@@ -91,7 +106,10 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   );
                 }
               }
-              fs.unlinkSync(filePath);
+              try { fs.unlinkSync(filePath); } catch (unlinkErr: unknown) {
+                // ENOENT = already deleted (e.g., stale duplicate process race) — ignore
+                if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkErr;
+              }
             } catch (err) {
               logger.error(
                 { file, sourceGroup, err },
@@ -99,10 +117,13 @@ export function startIpcWatcher(deps: IpcDeps): void {
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
+              try {
+                fs.renameSync(filePath, path.join(errorDir, `${sourceGroup}-${file}`));
+              } catch (renameErr: unknown) {
+                if ((renameErr as NodeJS.ErrnoException).code !== 'ENOENT') {
+                  logger.error({ file, sourceGroup, err: renameErr }, 'Error moving IPC message to errors dir');
+                }
+              }
             }
           }
         }
@@ -125,7 +146,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               // Pass source group identity to processTaskIpc for authorization
               await processTaskIpc(data, sourceGroup, isMain, deps);
-              fs.unlinkSync(filePath);
+              try { fs.unlinkSync(filePath); } catch (unlinkErr: unknown) {
+                if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') throw unlinkErr;
+              }
             } catch (err) {
               logger.error(
                 { file, sourceGroup, err },
@@ -133,10 +156,13 @@ export function startIpcWatcher(deps: IpcDeps): void {
               );
               const errorDir = path.join(ipcBaseDir, 'errors');
               fs.mkdirSync(errorDir, { recursive: true });
-              fs.renameSync(
-                filePath,
-                path.join(errorDir, `${sourceGroup}-${file}`),
-              );
+              try {
+                fs.renameSync(filePath, path.join(errorDir, `${sourceGroup}-${file}`));
+              } catch (renameErr: unknown) {
+                if ((renameErr as NodeJS.ErrnoException).code !== 'ENOENT') {
+                  logger.error({ file, sourceGroup, err: renameErr }, 'Error moving IPC task to errors dir');
+                }
+              }
             }
           }
         }
@@ -170,6 +196,8 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For journal / dump skill tasks
+    params?: { content?: string; tags?: string[]; tasks?: string[]; vault_path?: string; url?: string; mode?: string };
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -380,6 +408,318 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'journal': {
+      if (!data.taskId || !data.params?.content) {
+        logger.warn({ data }, 'Invalid journal task: missing taskId or content');
+        break;
+      }
+      const { taskId: journalTaskId, params: journalParams } = data as {
+        taskId: string;
+        params: { content: string };
+      };
+      const journalSkillDir = path.join(process.cwd(), '.claude', 'skills', 'journal');
+      const journalScript = path.join(journalSkillDir, 'journal.ts');
+      // journal.ts only does file I/O — no URL secrets needed (chaining handled by MCP layer)
+      const journalSecrets = {};
+      const journalResultDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'journal_results');
+      fs.mkdirSync(journalResultDir, { recursive: true });
+      const journalResultFile = path.join(journalResultDir, `${journalTaskId}.json`);
+
+      logger.info({ taskId: journalTaskId, sourceGroup }, 'Processing journal task');
+
+      const tsxBin = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
+      const journalProc = spawn(
+        tsxBin,
+        [journalScript],
+        {
+          cwd: journalSkillDir,
+          env: { NODE_ENV: process.env.NODE_ENV || 'production', ...(process.env.TZ ? { TZ: process.env.TZ } : {}) },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
+      journalProc.stdin.write(JSON.stringify({ params: journalParams, secrets: journalSecrets }));
+      journalProc.stdin.end();
+
+      let journalOut = '';
+      let journalErr = '';
+      journalProc.stdout.on('data', (d: Buffer) => { journalOut += d.toString(); });
+      journalProc.stderr.on('data', (d: Buffer) => { journalErr += d.toString(); });
+
+      await new Promise<void>((resolve) => {
+        journalProc.on('close', (code) => {
+          if (code !== 0) {
+            logger.error({ code, stderr: journalErr }, 'journal script failed');
+            fs.writeFileSync(journalResultFile, JSON.stringify({
+              success: false,
+              error: journalErr || `Script exited with code ${code}`,
+            }));
+          } else {
+            try {
+              JSON.parse(journalOut.trim());
+              fs.writeFileSync(journalResultFile, journalOut.trim());
+            } catch {
+              fs.writeFileSync(journalResultFile, JSON.stringify({
+                success: false,
+                error: `Invalid script output: ${journalOut}`,
+              }));
+            }
+          }
+          logger.info({ taskId: journalTaskId, sourceGroup }, 'Journal task complete');
+          resolve();
+        });
+      });
+      break;
+    }
+
+    case 'dump': {
+      if (!data.taskId || !data.params?.tags || !data.params?.tasks) {
+        logger.warn({ data }, 'Invalid dump task: missing taskId, tags, or tasks');
+        break;
+      }
+      const { taskId: dumpTaskId, params: dumpParams } = data as {
+        taskId: string;
+        params: { tags: string[]; tasks: string[] };
+      };
+      const dumpSkillDir = path.join(process.cwd(), '.claude', 'skills', 'dump');
+      const dumpScript = path.join(dumpSkillDir, 'dump.ts');
+      // dump.ts only does file I/O — no URL secrets needed (chaining handled by MCP layer)
+      const dumpSecrets = {};
+      const dumpResultDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'dump_results');
+      fs.mkdirSync(dumpResultDir, { recursive: true });
+      const dumpResultFile = path.join(dumpResultDir, `${dumpTaskId}.json`);
+
+      logger.info({ taskId: dumpTaskId, sourceGroup, tags: dumpParams.tags }, 'Processing dump task');
+
+      const tsxBinDump = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
+      const dumpProc = spawn(
+        tsxBinDump,
+        [dumpScript],
+        {
+          cwd: dumpSkillDir,
+          env: { NODE_ENV: process.env.NODE_ENV || 'production', ...(process.env.TZ ? { TZ: process.env.TZ } : {}) },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
+      dumpProc.stdin.write(JSON.stringify({ params: dumpParams, secrets: dumpSecrets }));
+      dumpProc.stdin.end();
+
+      let dumpOut = '';
+      let dumpErr = '';
+      dumpProc.stdout.on('data', (d: Buffer) => { dumpOut += d.toString(); });
+      dumpProc.stderr.on('data', (d: Buffer) => { dumpErr += d.toString(); });
+
+      await new Promise<void>((resolve) => {
+        dumpProc.on('close', (code) => {
+          if (code !== 0) {
+            logger.error({ code, stderr: dumpErr }, 'dump script failed');
+            fs.writeFileSync(dumpResultFile, JSON.stringify({
+              success: false,
+              error: dumpErr || `Script exited with code ${code}`,
+            }));
+          } else {
+            try {
+              JSON.parse(dumpOut.trim());
+              fs.writeFileSync(dumpResultFile, dumpOut.trim());
+            } catch {
+              fs.writeFileSync(dumpResultFile, JSON.stringify({
+                success: false,
+                error: `Invalid script output: ${dumpOut}`,
+              }));
+            }
+          }
+          logger.info({ taskId: dumpTaskId, sourceGroup }, 'Dump task complete');
+          resolve();
+        });
+      });
+      break;
+    }
+
+    case 'write_vault_file': {
+      if (!data.taskId || !data.params?.vault_path || data.params?.content === undefined || !data.params?.mode) {
+        logger.warn({ data }, 'Invalid write_vault_file task: missing taskId, vault_path, content, or mode');
+        break;
+      }
+      const { taskId: wvfTaskId, params: wvfParams } = data as {
+        taskId: string;
+        params: { vault_path: string; content: string; mode: string };
+      };
+      const wvfSkillDir = path.join(process.cwd(), '.claude', 'skills', 'vault');
+      const wvfScript = path.join(wvfSkillDir, 'write_vault_file.ts');
+      // Pure filesystem — no secrets needed
+      const wvfResultDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'write_vault_file_results');
+      fs.mkdirSync(wvfResultDir, { recursive: true });
+      const wvfResultFile = path.join(wvfResultDir, `${wvfTaskId}.json`);
+
+      logger.info({ taskId: wvfTaskId, sourceGroup, vault_path: wvfParams.vault_path, mode: wvfParams.mode }, 'Processing write_vault_file task');
+
+      const tsxBinWvf = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
+      const wvfProc = spawn(
+        tsxBinWvf,
+        [wvfScript],
+        {
+          cwd: wvfSkillDir,
+          env: { NODE_ENV: process.env.NODE_ENV || 'production', ...(process.env.TZ ? { TZ: process.env.TZ } : {}) },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
+      wvfProc.stdin.write(JSON.stringify({ params: wvfParams }));
+      wvfProc.stdin.end();
+
+      let wvfOut = '';
+      let wvfErr = '';
+      wvfProc.stdout.on('data', (d: Buffer) => { wvfOut += d.toString(); });
+      wvfProc.stderr.on('data', (d: Buffer) => { wvfErr += d.toString(); });
+
+      await new Promise<void>((resolve) => {
+        wvfProc.on('close', (code) => {
+          if (code !== 0) {
+            logger.error({ code, stderr: wvfErr }, 'write_vault_file script failed');
+            fs.writeFileSync(wvfResultFile, JSON.stringify({
+              success: false,
+              error: wvfErr || `Script exited with code ${code}`,
+            }));
+          } else {
+            try {
+              JSON.parse(wvfOut.trim());
+              fs.writeFileSync(wvfResultFile, wvfOut.trim());
+            } catch {
+              fs.writeFileSync(wvfResultFile, JSON.stringify({
+                success: false,
+                error: `Invalid script output: ${wvfOut}`,
+              }));
+            }
+          }
+          logger.info({ taskId: wvfTaskId, sourceGroup }, 'write_vault_file task complete');
+          resolve();
+        });
+      });
+      break;
+    }
+
+    case 'vault_url': {
+      if (!data.taskId || !data.params?.vault_path) {
+        logger.warn({ data }, 'Invalid vault_url task: missing taskId or vault_path');
+        break;
+      }
+      const { taskId: vaultUrlTaskId, params: vaultUrlParams } = data as {
+        taskId: string;
+        params: { vault_path: string };
+      };
+      const vaultUrlSkillDir = path.join(process.cwd(), '.claude', 'skills', 'vault');
+      const vaultUrlScript = path.join(vaultUrlSkillDir, 'get_vault_url.ts');
+      const vaultUrlSecrets = readEnvFile(['NOTES_URL']);
+      const vaultUrlResultDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'vault_url_results');
+      fs.mkdirSync(vaultUrlResultDir, { recursive: true });
+      const vaultUrlResultFile = path.join(vaultUrlResultDir, `${vaultUrlTaskId}.json`);
+
+      logger.info({ taskId: vaultUrlTaskId, sourceGroup, vault_path: vaultUrlParams.vault_path }, 'Processing vault_url task');
+
+      const tsxBinVaultUrl = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
+      const vaultUrlProc = spawn(
+        tsxBinVaultUrl,
+        [vaultUrlScript],
+        {
+          cwd: vaultUrlSkillDir,
+          env: { NODE_ENV: process.env.NODE_ENV || 'production', ...(process.env.TZ ? { TZ: process.env.TZ } : {}) },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
+      vaultUrlProc.stdin.write(JSON.stringify({ params: vaultUrlParams, secrets: vaultUrlSecrets }));
+      vaultUrlProc.stdin.end();
+
+      let vaultUrlOut = '';
+      let vaultUrlErr = '';
+      vaultUrlProc.stdout.on('data', (d: Buffer) => { vaultUrlOut += d.toString(); });
+      vaultUrlProc.stderr.on('data', (d: Buffer) => { vaultUrlErr += d.toString(); });
+
+      await new Promise<void>((resolve) => {
+        vaultUrlProc.on('close', (code) => {
+          if (code !== 0) {
+            logger.error({ code, stderr: vaultUrlErr }, 'get_vault_url script failed');
+            fs.writeFileSync(vaultUrlResultFile, JSON.stringify({
+              success: false,
+              error: vaultUrlErr || `Script exited with code ${code}`,
+            }));
+          } else {
+            try {
+              JSON.parse(vaultUrlOut.trim());
+              fs.writeFileSync(vaultUrlResultFile, vaultUrlOut.trim());
+            } catch {
+              fs.writeFileSync(vaultUrlResultFile, JSON.stringify({
+                success: false,
+                error: `Invalid script output: ${vaultUrlOut}`,
+              }));
+            }
+          }
+          logger.info({ taskId: vaultUrlTaskId, sourceGroup }, 'vault_url task complete');
+          resolve();
+        });
+      });
+      break;
+    }
+
+    case 'short_url': {
+      if (!data.taskId || !data.params?.url) {
+        logger.warn({ data }, 'Invalid short_url task: missing taskId or url');
+        break;
+      }
+      const { taskId: shortUrlTaskId, params: shortUrlParams } = data as {
+        taskId: string;
+        params: { url: string };
+      };
+      const shortUrlSkillDir = path.join(process.cwd(), '.claude', 'skills', 'vault');
+      const shortUrlScript = path.join(shortUrlSkillDir, 'get_short_url.ts');
+      const shortUrlSecrets = readEnvFile(['SHLINK_URL', 'SHLINK_API_KEY', 'SHLINK']);
+      const shortUrlResultDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'short_url_results');
+      fs.mkdirSync(shortUrlResultDir, { recursive: true });
+      const shortUrlResultFile = path.join(shortUrlResultDir, `${shortUrlTaskId}.json`);
+
+      logger.info({ taskId: shortUrlTaskId, sourceGroup, url: shortUrlParams.url }, 'Processing short_url task');
+
+      const tsxBinShortUrl = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
+      const shortUrlProc = spawn(
+        tsxBinShortUrl,
+        [shortUrlScript],
+        {
+          cwd: shortUrlSkillDir,
+          env: { NODE_ENV: process.env.NODE_ENV || 'production', ...(process.env.TZ ? { TZ: process.env.TZ } : {}) },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
+      shortUrlProc.stdin.write(JSON.stringify({ params: shortUrlParams, secrets: shortUrlSecrets }));
+      shortUrlProc.stdin.end();
+
+      let shortUrlOut = '';
+      let shortUrlErr = '';
+      shortUrlProc.stdout.on('data', (d: Buffer) => { shortUrlOut += d.toString(); });
+      shortUrlProc.stderr.on('data', (d: Buffer) => { shortUrlErr += d.toString(); });
+
+      await new Promise<void>((resolve) => {
+        shortUrlProc.on('close', (code) => {
+          if (code !== 0) {
+            logger.error({ code, stderr: shortUrlErr }, 'get_short_url script failed');
+            fs.writeFileSync(shortUrlResultFile, JSON.stringify({
+              success: false,
+              error: shortUrlErr || `Script exited with code ${code}`,
+            }));
+          } else {
+            try {
+              JSON.parse(shortUrlOut.trim());
+              fs.writeFileSync(shortUrlResultFile, shortUrlOut.trim());
+            } catch {
+              fs.writeFileSync(shortUrlResultFile, JSON.stringify({
+                success: false,
+                error: `Invalid script output: ${shortUrlOut}`,
+              }));
+            }
+          }
+          logger.info({ taskId: shortUrlTaskId, sourceGroup }, 'short_url task complete');
+          resolve();
+        });
+      });
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');

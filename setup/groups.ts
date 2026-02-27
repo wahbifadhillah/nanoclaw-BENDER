@@ -153,11 +153,12 @@ sock.ev.on('connection.update', async (update) => {
 });
 `;
 
-    const output = execSync(`node --input-type=module -e ${JSON.stringify(syncScript)}`, {
+    const output = execSync(`node --input-type=module`, {
       cwd: projectRoot,
       encoding: 'utf-8',
       timeout: 45000,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      input: syncScript,
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
     syncOk = output.includes('SYNCED:');
     logger.info({ output: output.trim() }, 'Sync output');

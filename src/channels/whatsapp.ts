@@ -38,9 +38,24 @@ export class WhatsAppChannel implements Channel {
   private groupSyncTimerStarted = false;
 
   private opts: WhatsAppChannelOpts;
+  private reconnectAttempts = 0;
 
   constructor(opts: WhatsAppChannelOpts) {
     this.opts = opts;
+  }
+
+  private scheduleReconnect(reason: number | undefined): void {
+    // 405 = server-side rate limit/rejection — start with a 60s base delay
+    // Other disconnects — start with 5s base delay
+    const baseMs = reason === 405 ? 60_000 : 5_000;
+    const delay = Math.min(baseMs * 2 ** this.reconnectAttempts, 5 * 60_000);
+    this.reconnectAttempts++;
+    logger.info({ reason, attempt: this.reconnectAttempts, delayMs: Math.round(delay) }, 'Scheduling reconnect');
+    setTimeout(() => {
+      this.connectInternal().catch((err) => {
+        logger.error({ err }, 'Reconnect attempt failed');
+      });
+    }, delay);
   }
 
   async connect(): Promise<void> {
@@ -85,21 +100,14 @@ export class WhatsAppChannel implements Channel {
         logger.info({ reason, shouldReconnect, queuedMessages: this.outgoingQueue.length }, 'Connection closed');
 
         if (shouldReconnect) {
-          logger.info('Reconnecting...');
-          this.connectInternal().catch((err) => {
-            logger.error({ err }, 'Failed to reconnect, retrying in 5s');
-            setTimeout(() => {
-              this.connectInternal().catch((err2) => {
-                logger.error({ err: err2 }, 'Reconnection retry failed');
-              });
-            }, 5000);
-          });
+          this.scheduleReconnect(reason);
         } else {
           logger.info('Logged out. Run /setup to re-authenticate.');
           process.exit(0);
         }
       } else if (connection === 'open') {
         this.connected = true;
+        this.reconnectAttempts = 0;
         logger.info('Connected to WhatsApp');
 
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"\nimport json\nwith open\\('/opt/nanoclaw/data/sessions/main/.claude/projects/-workspace-group/12f4fd27-a8f0-411c-889c-dbf1c4c26b97.jsonl'\\) as f:\n    lines = f.readlines\\(\\)\n\n# Look for the init message\nfor i, line in enumerate\\(lines\\):\n    line = line.strip\\(\\)\n    if not line: continue\n    try:\n        d = json.loads\\(line\\)\n        if d.get\\('type'\\) in \\('system', 'user', 'assistant'\\):\n            print\\(f'Line {i}: type={d[\\\\\"type\\\\\"]}', end=''\\)\n            if d.get\\('subtype'\\): print\\(f' subtype={d[\\\\\"subtype\\\\\"]}', end=''\\)\n            if d.get\\('model'\\): print\\(f' model={d[\\\\\"model\\\\\"]}', end=''\\)\n            if d.get\\('system_prompt'\\): print\\(f' sys_prompt[:100]={d[\\\\\"system_prompt\\\\\"][:100]}', end=''\\)\n            print\\(\\)\n    except: pass\n\" 2>&1 | head -30)",
+      "Bash(python3 -c \"\nimport json\nwith open\\('/opt/nanoclaw/data/sessions/main/.claude/projects/-workspace-group/12f4fd27-a8f0-411c-889c-dbf1c4c26b97.jsonl'\\) as f:\n    lines = f.readlines\\(\\)\n\n# Print first 5 non-queue entries\ncount = 0\nfor line in lines:\n    d = json.loads\\(line.strip\\(\\)\\)\n    if d.get\\('type'\\) == 'queue-operation': continue\n    count += 1\n    role = d.get\\('type','?'\\)\n    content = d.get\\('message',{}\\).get\\('content',''\\)\n    if isinstance\\(content, list\\):\n        content = ' '.join\\(p.get\\('text',''\\) for p in content if p.get\\('type'\\)=='text'\\)\n    print\\(f'--- {role} ---'\\)\n    print\\(str\\(content\\)[:400]\\)\n    print\\(\\)\n    if count >= 3: break\n\")"
+    ]
+  }
+}

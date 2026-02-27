@@ -19,9 +19,23 @@ agent-browser close             # Close browser
 ## Core workflow
 
 1. Navigate: `agent-browser open <url>`
-2. Snapshot: `agent-browser snapshot -i` (returns elements with refs like `@e1`, `@e2`)
-3. Interact using refs from the snapshot
-4. Re-snapshot after navigation or significant DOM changes
+2. **Wait**: `agent-browser wait --load networkidle` — ALWAYS wait after navigation
+3. Snapshot: `agent-browser snapshot -i` (returns elements with refs like `@e1`, `@e2`)
+4. Interact using refs from the snapshot
+5. Re-snapshot after any click that triggers navigation or DOM changes
+
+**Chain these together in a single call for efficiency:**
+```bash
+agent-browser open https://example.com && agent-browser wait --load networkidle && agent-browser snapshot -i
+```
+
+> **CRITICAL**: After clicking a link or button that triggers navigation, always wait before snapshotting:
+> ```bash
+> agent-browser click @e1
+> agent-browser wait --load networkidle  # ← never skip this
+> agent-browser snapshot -i
+> ```
+> Skipping the wait causes snapshot to run on a stale/loading page and will hang.
 
 ## Commands
 
