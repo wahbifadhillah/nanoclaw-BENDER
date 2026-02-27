@@ -119,22 +119,22 @@ sequenceDiagram
     participant User
     participant Channel
     participant DB
-    participant Loop as "Message Loop"
+    participant Loop as Message Loop
     participant Queue
     participant Container
 
-    User->>Channel: "Sends Message"
-    Channel->>DB: "storeMessage()"
-    Loop->>DB: "getNewMessages()"
-    DB-->>Loop: "Messages"
-    Loop->>Queue: "sendMessage() / enqueue()"
+    User->>Channel: Sends Message
+    Channel->>DB: storeMessage()
+    Loop->>DB: getNewMessages()
+    DB-->>Loop: Messages
+    Loop->>Queue: sendMessage() / enqueue()
     alt Container Active
-        Queue->>Container: "Pipe to stdin"
+        Queue->>Container: Pipe to stdin
     else Container Idle
-        Queue->>Container: "spawn(docker run)"
-        Container->>Container: "Initialize Agent"
+        Queue->>Container: spawn(docker run)
+        Container->>Container: Initialize Agent
     end
-    Container->>Container: "Process with LLM"
+    Container->>Container: Process with LLM
 ```
 
 ## Data Flow: Outbound Message (IPC)
@@ -142,14 +142,14 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Agent
-    participant IPC_Dir as "IPC Directory"
-    participant Watcher as "IPC Watcher"
+    participant IPC_Dir as IPC Directory
+    participant Watcher as IPC Watcher
     participant Channel
     participant User
 
-    Agent->>IPC_Dir: "Write message.json"
-    Watcher->>IPC_Dir: "Detect new file"
-    Watcher->>Channel: "sendMessage()"
-    Channel->>User: "Deliver Message"
-    Watcher->>IPC_Dir: "Delete message.json"
+    Agent->>IPC_Dir: Write message.json
+    Watcher->>IPC_Dir: Detect new file
+    Watcher->>Channel: sendMessage()
+    Channel->>User: Deliver Message
+    Watcher->>IPC_Dir: Delete message.json
 ```
