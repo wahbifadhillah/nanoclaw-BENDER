@@ -197,7 +197,7 @@ export async function processTaskIpc(
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
     // For journal / dump skill tasks
-    params?: { content?: string; tags?: string[]; tasks?: string[]; vault_path?: string; url?: string; mode?: string };
+    params?: { content?: string; tags?: string[]; tasks?: string[]; vault_path?: string; url?: string; mode?: string; query?: string };
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -715,6 +715,71 @@ export async function processTaskIpc(
             }
           }
           logger.info({ taskId: shortUrlTaskId, sourceGroup }, 'short_url task complete');
+          resolve();
+        });
+      });
+      break;
+    }
+
+    case 'search_vault': {
+      if (!data.taskId || !data.params?.query) {
+        logger.warn({ data }, 'Invalid search_vault task: missing taskId or query');
+        break;
+      }
+      const { taskId: svTaskId, params: svParams } = data as {
+        taskId: string;
+        params: { query: string; path?: string; mode?: string };
+      };
+      const svSkillDir = path.join(process.cwd(), '.claude', 'skills', 'vault');
+      const svScript = path.join(svSkillDir, 'search_vault.ts');
+      const svResultDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'search_vault_results');
+      fs.mkdirSync(svResultDir, { recursive: true });
+      const svResultFile = path.join(svResultDir, `${svTaskId}.json`);
+
+      logger.info({ taskId: svTaskId, sourceGroup, query: svParams.query }, 'Processing search_vault task');
+
+      const tsxBinSv = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
+      const svProc = spawn(
+        tsxBinSv,
+        [svScript],
+        {
+          cwd: svSkillDir,
+          env: {
+            NODE_ENV: process.env.NODE_ENV || 'production',
+            ...(process.env.TZ ? { TZ: process.env.TZ } : {}),
+            ...(process.env.NANOCLAW_VAULT_PATH ? { NANOCLAW_VAULT_PATH: process.env.NANOCLAW_VAULT_PATH } : {}),
+          },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
+      svProc.stdin.write(JSON.stringify({ params: svParams }));
+      svProc.stdin.end();
+
+      let svOut = '';
+      let svErr = '';
+      svProc.stdout.on('data', (d: Buffer) => { svOut += d.toString(); });
+      svProc.stderr.on('data', (d: Buffer) => { svErr += d.toString(); });
+
+      await new Promise<void>((resolve) => {
+        svProc.on('close', (code) => {
+          if (code !== 0) {
+            logger.error({ code, stderr: svErr }, 'search_vault script failed');
+            fs.writeFileSync(svResultFile, JSON.stringify({
+              success: false,
+              error: svErr || `Script exited with code ${code}`,
+            }));
+          } else {
+            try {
+              JSON.parse(svOut.trim());
+              fs.writeFileSync(svResultFile, svOut.trim());
+            } catch {
+              fs.writeFileSync(svResultFile, JSON.stringify({
+                success: false,
+                error: `Invalid script output: ${svOut}`,
+              }));
+            }
+          }
+          logger.info({ taskId: svTaskId, sourceGroup }, 'search_vault task complete');
           resolve();
         });
       });

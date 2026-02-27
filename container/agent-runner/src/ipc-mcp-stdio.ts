@@ -652,6 +652,65 @@ server.tool(
   },
 );
 
+server.tool(
+  'search_vault',
+  [
+    'Search for files or content in the Obsidian vault.',
+    'Use mode="content" (default) to search file bodies for a query string (case-insensitive).',
+    'Use mode="filename" to find files whose names contain the query.',
+    'Optionally limit the search to a vault subdirectory with the path parameter (e.g. "journal", "research").',
+    'Returns up to 20 matching files. Content mode includes up to 5 matching lines per file.',
+    'To read a specific file after finding it, use the Read tool at /workspace/vault/<file>.',
+  ].join(' '),
+  {
+    query: z.string().describe('Text to search for (case-insensitive, at least 2 characters)'),
+    path: z.string().optional().describe('Vault-relative subdirectory to limit search, e.g. "journal" or "research/ai"'),
+    mode: z.enum(['content', 'filename']).default('content').describe('"content" searches file bodies, "filename" matches file paths'),
+  },
+  async (args) => {
+    const taskId = `search-vault-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const result = await ipcCall(
+      'search_vault',
+      taskId,
+      { query: args.query, path: args.path, mode: args.mode },
+      'search_vault_results',
+    );
+
+    if (!result) {
+      return {
+        content: [{ type: 'text' as const, text: '❌ search_vault timed out.' }],
+        isError: true,
+      };
+    }
+
+    if (!result.success) {
+      return {
+        content: [{ type: 'text' as const, text: `❌ ${result.error || 'Search failed.'}` }],
+        isError: true,
+      };
+    }
+
+    const results = result.results as Array<{ file: string; matches: string[] }>;
+    const totalFiles = result.totalFiles as number;
+
+    if (results.length === 0) {
+      return {
+        content: [{ type: 'text' as const, text: `No matches found for "${args.query}" (scanned ${totalFiles} files).` }],
+      };
+    }
+
+    const lines: string[] = [`Found ${results.length} file(s) matching "${args.query}" (scanned ${totalFiles} files):\n`];
+    for (const r of results) {
+      lines.push(`📄 ${r.file}`);
+      for (const m of r.matches) {
+        lines.push(`   ${m}`);
+      }
+    }
+
+    return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

@@ -61,7 +61,11 @@ The `processTaskIpc()` function on the host dispatches tasks based on their `typ
 ### 3. Host Subprocesses
 Specialized TypeScript scripts run via `tsx`.
 - **Vault Writers**: `journal.ts`, `dump.ts`, `write_vault_file.ts`.
+- **Vault Readers**: `search_vault.ts` (content/filename search across `/opt/vault`).
 - **Utility Tools**: `get_vault_url.ts`, `get_short_url.ts`.
+
+### 4. Direct Vault Mount
+In addition to IPC-based tools, the vault (`/opt/vault`) is mounted read-only into every container at `/workspace/vault`. Agents can use their native `Read`, `Glob`, and `Grep` tools directly against this path for single-file reads or ad-hoc searches — no IPC overhead required. Use `mcp__nanoclaw__search_vault` when you need bounded, structured results across the whole vault.
 
 ## Debugging & Troubleshooting
 

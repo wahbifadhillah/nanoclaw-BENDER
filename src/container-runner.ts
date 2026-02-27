@@ -101,6 +101,17 @@ function buildVolumeMounts(
     }
   }
 
+  // Vault mount: read-only access to the Obsidian vault for all groups.
+  // Agents can use Read/Glob/Grep tools directly at /workspace/vault.
+  const vaultHostPath = process.env.NANOCLAW_VAULT_PATH || '/opt/vault';
+  if (fs.existsSync(vaultHostPath)) {
+    mounts.push({
+      hostPath: vaultHostPath,
+      containerPath: '/workspace/vault',
+      readonly: true,
+    });
+  }
+
   // Per-group Claude sessions directory (isolated from other groups)
   // Each group gets their own .claude/ to prevent cross-group session access
   const groupSessionsDir = path.join(
@@ -167,7 +178,7 @@ function buildVolumeMounts(
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
-  for (const sub of ['messages', 'tasks', 'input', 'journal_results', 'dump_results', 'vault_url_results', 'short_url_results', 'write_vault_file_results']) {
+  for (const sub of ['messages', 'tasks', 'input', 'journal_results', 'dump_results', 'vault_url_results', 'short_url_results', 'write_vault_file_results', 'search_vault_results']) {
     const dir = path.join(groupIpcDir, sub);
     fs.mkdirSync(dir, { recursive: true });
     try { fs.chmodSync(dir, 0o777); } catch { /* ignore */ }
