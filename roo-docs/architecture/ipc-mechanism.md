@@ -24,7 +24,7 @@ NanoClaw uses a simple, robust file-based IPC system. This avoids the complexity
 Runs on the host. It monitors the `messages/`, `tasks/`, and `input/` directories. When a file is detected, it dispatches the request to the appropriate handler (e.g., `channel.sendMessage`, `db.createTask`).
 
 ### IPC MCP Tools ([`container/agent-runner/src/ipc-mcp-stdio.ts`](container/agent-runner/src/ipc-mcp-stdio.ts))
-Runs inside the container. These tools provide a high-level API for the agent to perform IPC operations without manually handling files.
+Runs inside the container. These tools provide a high-level API for the agent to perform IPC operations without manually handling files. See [Agent Tool Architecture](agent-tools.md) for details on how complex tools like `+journal` use this layer.
 
 ## Security
 Each group has its own isolated IPC directory. An agent in one group cannot write to the IPC directory of another group, preventing cross-group privilege escalation.

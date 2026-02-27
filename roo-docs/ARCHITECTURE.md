@@ -58,6 +58,7 @@ graph TD
 
 ### 4. IPC Mechanism
 - **File-based IPC**: Communication via a shared IPC directory. See [IPC Mechanism Documentation](architecture/ipc-mechanism.md).
+- **Agent Tools**: High-level commands (journal, dump) implemented via IPC tasks. See [Agent Tool Architecture](architecture/agent-tools.md).
 - **Capabilities**: Message sending, task scheduling, group registration.
 
 ### 5. Task Scheduler
