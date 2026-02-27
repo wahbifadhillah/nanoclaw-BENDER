@@ -119,15 +119,15 @@ sequenceDiagram
     participant User
     participant Channel
     participant DB
-    participant Loop as Message Loop
+    participant MLoop as "Message Loop"
     participant Queue
     participant Container
 
     User->>Channel: Sends Message
     Channel->>DB: storeMessage()
-    Loop->>DB: getNewMessages()
-    DB-->>Loop: Messages
-    Loop->>Queue: sendMessage() / enqueue()
+    MLoop->>DB: getNewMessages()
+    DB-->>MLoop: Messages
+    MLoop->>Queue: sendMessage() / enqueue()
     alt Container Active
         Queue->>Container: Pipe to stdin
     else Container Idle
@@ -142,8 +142,8 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Agent
-    participant IPC_Dir as IPC Directory
-    participant Watcher as IPC Watcher
+    participant IPC_Dir as "IPC Directory"
+    participant Watcher as "IPC Watcher"
     participant Channel
     participant User
 
