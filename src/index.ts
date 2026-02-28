@@ -31,6 +31,7 @@ import {
   getNewMessages,
   getRouterState,
   initDatabase,
+  deleteSession,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -286,10 +287,12 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
+  // Wrap onOutput to track session ID from streamed results.
+  // Only save newSessionId from successful outputs — error outputs may carry
+  // a corrupted or mid-flight session ID that would perpetuate failures.
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
+        if (output.newSessionId && output.status !== 'error') {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
         }
@@ -311,7 +314,7 @@ async function runAgent(
       wrappedOnOutput,
     );
 
-    if (output.newSessionId) {
+    if (output.newSessionId && output.status !== 'error') {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
     }
@@ -321,6 +324,17 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
+      // If this error happened while resuming an existing session, the session
+      // transcript may be corrupted. Clear it so the next attempt starts fresh
+      // rather than retrying the same broken session forever.
+      if (sessionId) {
+        logger.warn(
+          { group: group.name, sessionId },
+          'Clearing session after resume error',
+        );
+        delete sessions[group.folder];
+        deleteSession(group.folder);
+      }
       return 'error';
     }
 

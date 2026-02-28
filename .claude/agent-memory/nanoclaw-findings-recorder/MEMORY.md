@@ -2,6 +2,7 @@
 
 ## Documented Findings Index
 - `debug-container-session-subdirectory-permissions.md` (2026-02-28) — Container EACCES crash on second run due to stale SDK-created subdirectory permissions in bind-mounted `.claude/` session dir
+- `debug-corrupted-session-parallel-tool-calls-gemini.md` (2026-02-28) — Claude Code session transcript corruption when Gemini makes parallel tool calls; only last result recorded. Crash with "process exited code 1" on resume. Fixed by clearing session from DB and backing up corrupted transcript.
 
 ## Recurring Patterns
 
@@ -25,4 +26,11 @@
 
 ## Key Files Involved in Recent Findings
 - `src/container-runner.ts` — Permission handling for bind-mounted session directories (lines 128-138)
-- `roo-docs/architecture/container-runner.md` — Architecture doc, has "Known Issues & Gotchas" section
+- `roo-docs/architecture/container-runner.md` — Architecture doc, has "Known Issues & Gotchas" section; updated with session transcript corruption info
+- `/opt/nanoclaw/store/messages.db` — SQLite DB where `sessions` table stores group_folder → session_id mapping. Must clear corrupted sessions via DELETE query.
+- `/opt/nanoclaw/data/sessions/<group>/.claude/debug/<session-id>.txt` — Claude Code's internal debug log; PRIMARY source of truth for subprocess crashes
+
+## Model-Specific Issues
+- **Gemini via OpenRouter**: Makes parallel tool calls but session transcript recording only captures the last result. Corrupts transcripts, causing resume failure. See `debug-corrupted-session-parallel-tool-calls-gemini.md`.
+- **Anthropic Claude**: Sequential tool calls, no known transcript issues
+- **Implication**: Non-Anthropic models with parallel tool support need special handling in session resumption logic

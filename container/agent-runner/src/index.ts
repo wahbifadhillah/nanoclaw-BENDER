@@ -583,10 +583,11 @@ async function main(): Promise<void> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+    // Do NOT include newSessionId here — the session may be corrupted or
+    // mid-flight. Omitting it prevents the host from re-saving a bad session ID.
     writeOutput({
       status: 'error',
       result: null,
-      newSessionId: sessionId,
       error: errorMessage
     });
     process.exit(1);

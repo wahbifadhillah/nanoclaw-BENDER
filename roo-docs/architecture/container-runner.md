@@ -64,3 +64,24 @@ For existing corrupted session directories, run:
 ```bash
 find /opt/nanoclaw/data/sessions -type d \( -name "debug" -o -name "telemetry" \) -exec chmod 777 {} \;
 ```
+
+### Session Transcript Corruption (Parallel Tool Calls)
+
+When using non-Anthropic models (Gemini, Claude via third-party, etc.) that support parallel tool calls, session transcripts can become corrupted with mismatched tool call/result pairs. This causes Claude Code to crash on resume with "process exited with code 1".
+
+**Symptoms**:
+- Container logs show `error_during_execution` + "Claude Code process exited with code 1"
+- A `type=result` message appears before `type=system/init` (session never initialized)
+- The same session ID is retried on every run
+
+**How to diagnose**:
+1. Find the session ID: `sqlite3 /opt/nanoclaw/store/messages.db "SELECT session_id FROM sessions WHERE group_folder = '<group>'"`
+2. Check the debug log: `/opt/nanoclaw/data/sessions/<group>/.claude/debug/<session-id>.txt`
+3. Look for `ensureToolResultPairing` errors — this indicates a corrupted transcript
+
+**How to fix**:
+1. Back up the transcript: `mv /opt/nanoclaw/data/sessions/<group>/.claude/projects/-workspace-group/<session-id>.jsonl{,.corrupted}`
+2. Clear the session: `sqlite3 /opt/nanoclaw/store/messages.db "DELETE FROM sessions WHERE group_folder = '<group>'"`
+3. Next container run will create a fresh session
+
+See also: [Troubleshooting & Debugging Findings](troubleshooting.md) for full investigation details.

@@ -65,6 +65,9 @@ graph TD
 - **Recurring Tasks**: [`src/task-scheduler.ts`](src/task-scheduler.ts) allows agents to schedule future executions (e.g., daily reports, reminders).
 - **Persistence**: Tasks are stored in the database and survive system restarts.
 
+### 6. Troubleshooting & Debugging
+- **Findings**: Detailed root cause analyses and remediation steps for complex issues. See [Troubleshooting Documentation](architecture/troubleshooting.md).
+
 ---
 
 ## File Structure
