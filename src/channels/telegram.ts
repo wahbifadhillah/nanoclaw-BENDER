@@ -1,9 +1,6 @@
-import fs from 'fs';
-import path from 'path';
-
 import { Api, Bot } from 'grammy';
 
-import { ASSISTANT_NAME, DATA_DIR, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -18,53 +15,44 @@ export interface TelegramChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
+// Fixed mapping: agent sender name → designated bot username
+const AGENT_BOT_MAP: Record<string, string> = {
+  'Bender': 'benderfromtijuana_bot',
+  'Professor Farnsworth': 'farnsworthfromnewyork_bot',
+  'Fry': 'philipfromnewyork_bot',
+  'Amy': 'amyfrommars_bot',
+  'Hermes': 'hermesfromkingston_bot',
+  'Zoidberg': 'zoidbergfromdecapod10_bot',
+  'Leela': 'leelaisnotalien_bot',
+  'Nibbler': 'thelordnibbler_bot',
+};
+
+// Pre-compute lowercase keys for case-insensitive matching
+const agentBotEntries = Object.entries(AGENT_BOT_MAP).map(
+  ([name, username]) => [name.toLowerCase(), username] as const,
+);
+
+/**
+ * Look up the designated bot username for a sender name.
+ * Supports case-insensitive exact match first, then partial/substring match.
+ */
+function resolveAgentBot(sender: string): string | undefined {
+  const lower = sender.toLowerCase();
+  // Exact case-insensitive match
+  for (const [name, username] of agentBotEntries) {
+    if (lower === name) return username;
+  }
+  // Partial match: sender contains the agent name or vice versa
+  for (const [name, username] of agentBotEntries) {
+    if (lower.includes(name) || name.includes(lower)) return username;
+  }
+  return undefined;
+}
+
 // Bot pool for agent teams: send-only Api instances (no polling)
 const poolApis: Api[] = [];
-// Bot usernames, parallel to poolApis (used for persistent assignment)
+// Bot usernames, parallel to poolApis
 const poolUsernames: string[] = [];
-// Maps "{groupFolder}:{senderName}" → pool Api index for stable assignment
-const senderBotMap = new Map<string, number>();
-// Maps "{groupFolder}:{senderName}" → bot username (persisted to disk)
-const senderUsernameMap = new Map<string, string>();
-let nextPoolIndex = 0;
-
-const POOL_MAP_FILE = path.join(DATA_DIR, 'pool-bot-map.json');
-
-function loadPoolMap(): void {
-  try {
-    if (!fs.existsSync(POOL_MAP_FILE)) return;
-    const data: Record<string, string> = JSON.parse(fs.readFileSync(POOL_MAP_FILE, 'utf-8'));
-    for (const [key, username] of Object.entries(data)) {
-      const idx = poolUsernames.indexOf(username);
-      if (idx !== -1) {
-        senderBotMap.set(key, idx);
-        senderUsernameMap.set(key, username);
-      } else {
-        logger.warn({ key, username }, 'Pool map entry references unknown bot username, skipping');
-      }
-    }
-    // Advance nextPoolIndex past already-assigned slots to avoid collisions
-    const usedIndices = new Set(senderBotMap.values());
-    while (usedIndices.has(nextPoolIndex % poolApis.length) && nextPoolIndex < poolApis.length) {
-      nextPoolIndex++;
-    }
-    logger.info(
-      { restored: senderBotMap.size, nextPoolIndex },
-      'Pool bot assignments restored from disk',
-    );
-  } catch (err) {
-    logger.warn({ err }, 'Failed to load pool bot map, starting fresh');
-  }
-}
-
-function savePoolMap(): void {
-  try {
-    fs.mkdirSync(path.dirname(POOL_MAP_FILE), { recursive: true });
-    fs.writeFileSync(POOL_MAP_FILE, JSON.stringify(Object.fromEntries(senderUsernameMap), null, 2));
-  } catch (err) {
-    logger.warn({ err }, 'Failed to save pool bot map');
-  }
-}
 
 /**
  * Initialize send-only Api instances for the bot pool.
@@ -86,7 +74,6 @@ export async function initBotPool(tokens: string[]): Promise<void> {
   }
   if (poolApis.length > 0) {
     logger.info({ count: poolApis.length }, 'Telegram bot pool ready');
-    loadPoolMap();
   }
 }
 
@@ -99,38 +86,34 @@ export function hasPoolBots(): boolean {
 
 /**
  * Send a message via a pool bot assigned to the given sender name.
- * Assigns bots round-robin on first use; subsequent messages from the
- * same sender in the same group always use the same bot.
+ * Uses a fixed agent-to-bot mapping (AGENT_BOT_MAP) instead of round-robin.
+ * Returns 'sent' on success, 'unknown_agent' if sender has no mapped bot,
+ * or 'no_pool' if no pool bots are available.
  */
 export async function sendPoolMessage(
   chatId: string,
   text: string,
   sender: string,
-  groupFolder: string,
-): Promise<void> {
+  _groupFolder: string,
+): Promise<'sent' | 'unknown_agent' | 'no_pool'> {
   if (poolApis.length === 0) {
-    logger.warn('No pool bots available, falling back to main bot send');
-    return;
+    logger.warn('No pool bots available');
+    return 'no_pool';
   }
 
-  const key = `${groupFolder}:${sender}`;
-  let idx = senderBotMap.get(key);
-  if (idx === undefined) {
-    idx = nextPoolIndex % poolApis.length;
-    nextPoolIndex++;
-    senderBotMap.set(key, idx);
-    senderUsernameMap.set(key, poolUsernames[idx] || '');
-    savePoolMap();
-    try {
-      await poolApis[idx].setMyName(sender);
-      await new Promise((r) => setTimeout(r, 2000));
-      logger.info(
-        { sender, groupFolder, poolIndex: idx, botUsername: poolUsernames[idx] },
-        'Assigned and renamed pool bot',
-      );
-    } catch (err) {
-      logger.warn({ sender, err }, 'Failed to rename pool bot (sending anyway)');
-    }
+  const botUsername = resolveAgentBot(sender);
+  if (!botUsername) {
+    logger.warn({ sender }, 'No bot mapping found for agent sender');
+    return 'unknown_agent';
+  }
+
+  const idx = poolUsernames.indexOf(botUsername);
+  if (idx === -1) {
+    logger.warn(
+      { sender, botUsername },
+      'Mapped bot username not found in pool — is the bot token in TELEGRAM_BOT_POOL?',
+    );
+    return 'unknown_agent';
   }
 
   const api = poolApis[idx];
@@ -144,9 +127,14 @@ export async function sendPoolMessage(
         await api.sendMessage(numericId, text.slice(i, i + MAX_LENGTH));
       }
     }
-    logger.info({ chatId, sender, poolIndex: idx, length: text.length }, 'Pool message sent');
+    logger.info(
+      { chatId, sender, botUsername, poolIndex: idx, length: text.length },
+      'Pool message sent',
+    );
+    return 'sent';
   } catch (err) {
     logger.error({ chatId, sender, err }, 'Failed to send pool message');
+    return 'sent'; // Still return 'sent' — we attempted delivery via the correct bot
   }
 }
 

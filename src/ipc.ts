@@ -85,13 +85,20 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
                   if (data.sender && data.chatJid.startsWith('tg:')) {
-                    await sendPoolMessage(
+                    const result = await sendPoolMessage(
                       data.chatJid,
                       data.text,
                       data.sender,
                       sourceGroup,
                     );
-                    deps.onPoolMessageSent?.(data.chatJid);
+                    if (result === 'unknown_agent') {
+                      await deps.sendMessage(
+                        data.chatJid,
+                        `Agent '${data.sender}' has no assigned bot. Add agent definition, then assign the task again.`,
+                      );
+                    } else {
+                      deps.onPoolMessageSent?.(data.chatJid);
+                    }
                   } else {
                     await deps.sendMessage(data.chatJid, data.text);
                   }

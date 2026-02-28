@@ -82,10 +82,11 @@ To start a team collaboration, use one of the following trigger phrases with the
 When these phrases are detected, the **Daily Agent (Bender)** acts as the orchestrator, coordinating the other agents.
 
 ### 2. How the Bot Pool Works
-NanoClaw maintains a pool of Telegram bots (configured in `TELEGRAM_BOT_POOL`). When an agent needs to speak:
-1.  **Assignment**: If the agent doesn't have a bot assigned in the current group, the next available bot from the pool is chosen (round-robin).
-2.  **Persistence**: This assignment is saved (in `data/pool-bot-map.json`) so the same agent always uses the same bot identity in that group, even after a restart.
-3.  **Renaming**: The assigned bot is automatically renamed in Telegram to the agent's persona name (e.g., "Prof. Hubert J. Farnsworth") using the `setMyName` API.
+NanoClaw maintains a pool of Telegram bots (configured in `TELEGRAM_BOT_POOL`). Each agent has a **fixed, deterministic bot identity** — the mapping is hardcoded in `src/channels/telegram.ts` (`AGENT_BOT_MAP`).
+
+1.  **Fixed Assignment**: Each agent always uses the same bot (e.g., Farnsworth always uses `farnsworthfromnewyork_bot`). There is no round-robin — the mapping is static.
+2.  **No Persistence Needed**: Since the mapping is hardcoded, there is no `data/pool-bot-map.json` file. The assignment is always consistent across restarts.
+3.  **Unknown Agents**: If an agent tries to send a message but has no bot mapped, the main bot sends a warning: "Agent '{name}' has no assigned bot."
 
 ### 3. What to Expect in Chat
 *   **Multiple Bots**: You will see messages from different "users" (bots) in the group, each with the name and profile of the specialized agent.
@@ -108,7 +109,7 @@ sequenceDiagram
     NC->>Agent: Pipe message to stdin
     Agent->>Agent: Decide to call Professor
     Agent->>NC: Write message.json (IPC)
-    NC->>NC: Assign/Rename Pool Bot
+    NC->>NC: Look up fixed bot mapping
     NC->>PoolBot: sendMessage
     PoolBot->>TG: "Prof. Farnsworth: Good news!..."
     TG->>User: Message appears from "Prof. Farnsworth"
