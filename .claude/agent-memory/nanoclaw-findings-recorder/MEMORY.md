@@ -1,6 +1,7 @@
 # NanoClaw Findings Recorder Memory
 
 ## Documented Findings Index
+- `debug-agent-teams-premature-stream-end.md` (2026-02-28) — Agent teams (swarm scenarios) had teammates killed mid-work because `stream.end()` was called on first result, closing stdin and triggering CLI shutdown sequence. Fixed by removing premature `stream.end()` from result handler.
 - `debug-container-session-subdirectory-permissions.md` (2026-02-28) — Container EACCES crash on second run due to stale SDK-created subdirectory permissions in bind-mounted `.claude/` session dir
 - `debug-corrupted-session-parallel-tool-calls-gemini.md` (2026-02-28) — Claude Code session transcript corruption when Gemini makes parallel tool calls; only last result recorded. Crash with "process exited code 1" on resume. Fixed by clearing session from DB and backing up corrupted transcript.
 
@@ -34,3 +35,9 @@
 - **Gemini via OpenRouter**: Makes parallel tool calls but session transcript recording only captures the last result. Corrupts transcripts, causing resume failure. See `debug-corrupted-session-parallel-tool-calls-gemini.md`.
 - **Anthropic Claude**: Sequential tool calls, no known transcript issues
 - **Implication**: Non-Anthropic models with parallel tool support need special handling in session resumption logic
+
+## Agent Teams Lifecycle Pattern
+- **Architecture**: Multi-agent swarms (leader spawns teammates) rely on `MessageStream` to stay open across multiple result messages
+- **Critical**: `stream.end()` must NOT be called on first result—it closes stdin, triggers CLI shutdown sequence, kills in-progress teammates
+- **Cleanup**: Handled by host-side idle timeout (`_close` sentinel via IPC, 30 min after last output) + `pollIpcDuringQuery()` during leader work
+- **Files involved**: `container/agent-runner/src/index.ts` (query loop, stream management), `docs/SDK_DEEP_DIVE.md` (architectural context for `isSingleUserTurn` fix)

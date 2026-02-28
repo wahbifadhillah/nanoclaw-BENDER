@@ -487,9 +487,11 @@ async function runQuery(
         result: textResult || null,
         newSessionId
       });
-      // Signal claude to exit — without this, the MessageStream stays open
-      // and claude waits for more input indefinitely (sleeping until 30-min timeout).
-      stream.end();
+      // DO NOT call stream.end() here — it closes stdin to the CLI, which
+      // triggers the teammate shutdown sequence and kills agent teams mid-work.
+      // The CLI will keep running until all teammates finish, then the host's
+      // idle timeout (_close sentinel via IPC) will signal stream.end().
+      // IPC follow-up messages are already handled by pollIpcDuringQuery above.
     }
   }
 
