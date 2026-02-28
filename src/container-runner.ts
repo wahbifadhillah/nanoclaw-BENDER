@@ -58,8 +58,12 @@ function buildVolumeMounts(
   prompt: string = '',
 ): { mounts: VolumeMount[]; selectedAgent: AgentName } {
   const mounts: VolumeMount[] = [];
-  const selectedAgent = routeModel(prompt);
-  const modelName = getModelEnvValue(selectedAgent);
+  const { agent: selectedAgent, isTeamRequest } = routeModel(prompt);
+  // Team requests need a more capable model for multi-step orchestration.
+  // flash-lite can't reliably follow TeamCreate instructions, so upgrade to flash.
+  const modelName = (isTeamRequest && selectedAgent === 'daily')
+    ? 'google/gemini-2.5-flash'
+    : getModelEnvValue(selectedAgent);
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
 

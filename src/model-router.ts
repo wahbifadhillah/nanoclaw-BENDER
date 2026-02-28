@@ -111,7 +111,12 @@ const TEAM_PATTERNS = [
  * Agent keywords only trigger routing when they're direct commands to
  * that agent, not when they appear as team member descriptions.
  */
-export function routeModel(prompt: string): AgentName {
+export interface RouteResult {
+  agent: AgentName;
+  isTeamRequest: boolean;
+}
+
+export function routeModel(prompt: string): RouteResult {
   // Unescape XML entities — formatMessages escapes > to &gt; etc.
   // Without this, patterns like '>fry' never match user-typed '>fry'.
   const normalizedPrompt = prompt
@@ -126,18 +131,18 @@ export function routeModel(prompt: string): AgentName {
   // Without this, "Assemble team... >professor..." would route to the
   // deep-research agent instead of letting the orchestrator handle it.
   if (TEAM_PATTERNS.some(p => normalizedPrompt.includes(p))) {
-    return DEFAULT_AGENT;
+    return { agent: DEFAULT_AGENT, isTeamRequest: true };
   }
 
   for (const route of MODEL_ROUTES) {
     for (const pattern of route.patterns) {
       if (normalizedPrompt.includes(pattern.toLowerCase())) {
-        return route.agent;
+        return { agent: route.agent, isTeamRequest: false };
       }
     }
   }
 
-  return DEFAULT_AGENT;
+  return { agent: DEFAULT_AGENT, isTeamRequest: false };
 }
 
 /**
