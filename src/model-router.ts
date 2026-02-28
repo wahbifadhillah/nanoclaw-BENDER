@@ -94,8 +94,22 @@ export const AGENT_MODELS: Record<AgentName, string> = {
   'science-reviewer': 'google/gemini-2.5-flash',
 };
 
+// Patterns that indicate the user wants to orchestrate a team.
+// When detected, always route to the default agent (Bender) so he can
+// coordinate, even if agent keywords like ">professor" appear in the prompt.
+const TEAM_PATTERNS = [
+  'assemble a team',
+  'assemble team',
+  'team of',
+];
+
 /**
- * Route a prompt to the appropriate agent based on content
+ * Route a prompt to the appropriate agent based on content.
+ *
+ * Team orchestration prompts (e.g., "Assemble team... >professor... >amy")
+ * always route to the default agent so it can coordinate via TeamCreate.
+ * Agent keywords only trigger routing when they're direct commands to
+ * that agent, not when they appear as team member descriptions.
  */
 export function routeModel(prompt: string): AgentName {
   // Unescape XML entities — formatMessages escapes > to &gt; etc.
@@ -107,6 +121,13 @@ export function routeModel(prompt: string): AgentName {
     .replace(/&lt;/g, '<')
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"');
+
+  // Team orchestration: route to default agent (Bender) so he can coordinate.
+  // Without this, "Assemble team... >professor..." would route to the
+  // deep-research agent instead of letting the orchestrator handle it.
+  if (TEAM_PATTERNS.some(p => normalizedPrompt.includes(p))) {
+    return DEFAULT_AGENT;
+  }
 
   for (const route of MODEL_ROUTES) {
     for (const pattern of route.patterns) {
