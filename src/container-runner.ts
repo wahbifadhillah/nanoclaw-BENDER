@@ -25,6 +25,7 @@ import {
 } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import { routeModel, getModelEnvValue } from './model-router.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -57,8 +58,14 @@ interface VolumeMount {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  prompt: string = '',
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
+  const { agent: selectedAgent, isTeamRequest } = routeModel(prompt);
+  // Team requests need a more capable model for multi-step orchestration.
+  const modelName = (isTeamRequest && selectedAgent === 'daily')
+    ? 'google/gemini-2.5-flash'
+    : getModelEnvValue(selectedAgent);
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
 
@@ -110,28 +117,35 @@ function buildVolumeMounts(
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
-        },
-        null,
-        2,
-      ) + '\n',
-    );
-  }
+
+  // Always rewrite settings so the routed model is applied on every run.
+  const settings = fs.existsSync(settingsFile)
+    ? JSON.parse(fs.readFileSync(settingsFile, 'utf-8'))
+    : { env: {} };
+
+  settings.env = {
+    ...settings.env,
+    // Enable agent swarms (subagent orchestration)
+    // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+    // Load CLAUDE.md from additional mounted directories
+    // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+    CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+    // Enable Claude's memory feature (persists user preferences between sessions)
+    // https://code.claude.com/docs/en/memory#manage-auto-memory
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+    // Route API calls through LiteLLM proxy (translates to OpenRouter)
+    ANTHROPIC_BASE_URL: 'http://host.docker.internal:4000',
+    // Set model based on agent routing
+    ANTHROPIC_MODEL: modelName,
+  };
+
+  fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + '\n');
+
+  logger.info(
+    { prompt: prompt.substring(0, 60), agent: selectedAgent, modelName },
+    'Agent routing applied',
+  );
 
   // Sync skills from container/skills/ into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
@@ -202,9 +216,16 @@ function buildVolumeMounts(
 /**
  * Read allowed secrets from .env for passing to the container via stdin.
  * Secrets are never written to disk or mounted as files.
+ * OPENROUTER_API_KEY is accepted as an alias for ANTHROPIC_API_KEY.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  const env = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'OPENROUTER_API_KEY']);
+  // OPENROUTER_API_KEY takes priority — allows keeping both keys in .env
+  if (env.OPENROUTER_API_KEY) {
+    env.ANTHROPIC_API_KEY = env.OPENROUTER_API_KEY;
+  }
+  delete env.OPENROUTER_API_KEY;
+  return env;
 }
 
 function buildContainerArgs(
@@ -215,6 +236,11 @@ function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Allow the container to reach the LiteLLM proxy running on the host.
+  // LiteLLM translates Anthropic /messages format to OpenRouter /chat/completions.
+  args.push('--add-host=host.docker.internal:host-gateway');
+  args.push('-e', 'ANTHROPIC_BASE_URL=http://host.docker.internal:4000');
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -250,7 +276,7 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const mounts = buildVolumeMounts(group, input.isMain, input.prompt);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);

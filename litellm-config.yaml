@@ -1,0 +1,32 @@
+# LiteLLM proxy — translates Anthropic /messages format to OpenRouter /chat/completions
+# Allows the Claude Agent SDK to use non-Anthropic models via OpenRouter
+
+general_settings:
+  # No master key = allow all requests (local-only proxy)
+  drop_params: true  # drop unsupported params silently
+
+model_list:
+  - model_name: google/gemini-2.5-flash-lite
+    litellm_params:
+      model: openrouter/google/gemini-2.5-flash-lite
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: google/gemini-2.5-flash
+    litellm_params:
+      model: openrouter/google/gemini-2.5-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: google/gemini-3-flash-preview
+    litellm_params:
+      model: openrouter/google/gemini-3-flash-preview
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: openai/gpt-4o-mini
+    litellm_params:
+      model: openrouter/openai/gpt-4o-mini
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  - model_name: minimax/minimax-m2.5
+    litellm_params:
+      model: openrouter/minimax/minimax-m2.5
+      api_key: os.environ/OPENROUTER_API_KEY
